@@ -251,44 +251,83 @@ int create_tftp_buffer_for_data_packet(struct tftp_data *packet ,char *buffer) {
 
 void handle_read_request(
     struct tftp_rqq* request,
-    int socketfd,
-    struct sockaddr* p
+    struct sockaddr* client_addr
 ) {
+    // Create a new socket for this transfer (TFTP protocol requirement)
+    int transfer_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (transfer_sockfd == -1) {
+        perror("Failed to create transfer socket");
+        return;
+    }
+
+    // Bind to any available port (let OS choose)
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = 0; // Let OS choose port
+    
+    if (bind(transfer_sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("Failed to bind transfer socket");
+        close(transfer_sockfd);
+        return;
+    }
+
+    // Get the port number assigned by OS for logging
+    socklen_t addr_len = sizeof(server_addr);
+    if (getsockname(transfer_sockfd, (struct sockaddr*)&server_addr, &addr_len) == 0) {
+        printf("Created transfer socket on port %d\n", ntohs(server_addr.sin_port));
+    }
+
     // 1. parse out the buffer.
     // 2. create a Data packet
     // 3. send this back to the client who requested it. (for all the blocks)
     int count = 0;
     struct tftp_data* packets = create_data(request, &count);
     if (packets == NULL || count == 0) {
-        send_error_message((uint16_t)1, "File not found", socketfd, p);
+        send_error_message((uint16_t)1, "File not found", transfer_sockfd, client_addr);
+        close(transfer_sockfd);
         return;
     }
+    
+    printf("Starting file transfer for '%s' (%d blocks)\n", request->file_name, count);
+    
     for (int i = 0; i < count; i++) {
         // serialise the struct into bytes to send to the client.
         struct tftp_data packet = packets[i];
         char buffer[1024];
         memset(buffer, 0, 1024);
         int packet_length = create_tftp_buffer_for_data_packet(&packet, buffer);
-        fprintf(stdout, "Sending num_bytes: %d to socket info\n", packet_length);
+        fprintf(stdout, "Sending block %d (%d bytes) to client\n", packet.block_id, packet_length);
         int num_bytes = sendto(
-            socketfd, 
+            transfer_sockfd, 
             buffer,
             packet_length,
             0,
-            p, 
-            p->sa_len
+            client_addr, 
+            client_addr->sa_len
         );
         if (num_bytes == -1) {
-            perror("oh no - failed to send DATA packet to client\n");
-            exit(1);
+            perror("Failed to send DATA packet to client");
+            free_data(packets);
+            close(transfer_sockfd);
+            return;
         }
 
         // Now we need to wait to get an ACK pack from the client.
-        socklen_t addr_len = sizeof(struct sockaddr_storage);
-        int result = handle_ack_from_client(socketfd, p, &addr_len, packet.block_id);
-
+        socklen_t ack_addr_len = sizeof(struct sockaddr_storage);
+        int result = handle_ack_from_client(transfer_sockfd, client_addr, &ack_addr_len, packet.block_id);
+        if (result == -1) {
+            fprintf(stderr, "Failed to receive ACK for block %d, aborting transfer\n", packet.block_id);
+            free_data(packets);
+            close(transfer_sockfd);
+            return;
+        }
     }
+    
+    printf("File transfer completed successfully\n");
     free_data(packets);
+    close(transfer_sockfd);
 }
 
 
@@ -369,7 +408,7 @@ int main() {
         switch (op_code) {
             case 1: {
                 struct tftp_rqq request = deserialise_request(op_code, buf, num_bytes); 
-                handle_read_request(&request, sockfd, (struct sockaddr *)&their_addr);
+                handle_read_request(&request, (struct sockaddr *)&their_addr);
                 break;
             }
             case 2: {
